@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2.extras import DictCursor
@@ -10,17 +10,19 @@ from aiogram import Bot, Dispatcher, F, html
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
+from aiogram.enums import ParseMode, ChatMemberStatus
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("market-bot")
+logger = logging.getLogger("oldx-bot")
 
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+CHANNEL_ID = os.getenv("CHANNEL_ID", "@OLDXXbotkanal")
+CHANNEL_URL = "https://t.me/OLDXXbotkanal"
 
 if not TOKEN or not DATABASE_URL:
     raise SystemExit("XƏTA: BOT_TOKEN və ya DATABASE_URL tapılmadı.")
@@ -38,24 +40,28 @@ def init_db():
     c = conn.cursor()
     # İstifadəçilər
     c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id BIGINT PRIMARY KEY, full_name TEXT, balance INTEGER DEFAULT 0, 
-        referal_id BIGINT, referal_count INTEGER DEFAULT 0, last_bonus TEXT
+        user_id BIGINT PRIMARY KEY, full_name TEXT, 
+        azn_balance NUMERIC(10,2) DEFAULT 0, 
+        coin_balance INTEGER DEFAULT 0,
+        referal_id BIGINT, referal_count INTEGER DEFAULT 0, 
+        last_bonus TEXT
     )""")
-    # Market məhsulları
+    # Məhsullar (Market, PUBG, TikTok, SMM)
     c.execute("""CREATE TABLE IF NOT EXISTS products (
-        id SERIAL PRIMARY KEY, name TEXT, price INTEGER, is_active BOOLEAN DEFAULT TRUE
+        id SERIAL PRIMARY KEY, category TEXT, name TEXT, 
+        description TEXT, price NUMERIC(10,2), is_active BOOLEAN DEFAULT TRUE
     )""")
     # Sifarişlər
     c.execute("""CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY, user_id BIGINT, product_id INTEGER, product_name TEXT, 
-        price INTEGER, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        price NUMERIC(10,2), status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     conn.commit()
     
     # Admini qeydiyyata alırıq
     c.execute("SELECT 1 FROM users WHERE user_id=%s", (ADMIN_ID,))
     if not c.fetchone():
-        c.execute("INSERT INTO users (user_id, full_name, balance) VALUES (%s, %s, 1000)", (ADMIN_ID, "Admin"))
+        c.execute("INSERT INTO users (user_id, full_name, azn_balance, coin_balance) VALUES (%s, %s, 100, 1000)", (ADMIN_ID, "Admin"))
         conn.commit()
     c.close()
     conn.close()
@@ -69,29 +75,40 @@ def get_user(uid):
     conn.close()
     return u
 
-def update_balance(uid, amount):
+def update_balance(uid, azn=0, coin=0):
     conn = db()
     c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance + %s WHERE user_id=%s", (amount, uid))
+    c.execute("UPDATE users SET azn_balance = azn_balance + %s, coin_balance = coin_balance + %s WHERE user_id=%s", (azn, coin, uid))
     conn.commit()
     c.close()
     conn.close()
 
-# ---------- FSM ----------
-class BuyProduct(StatesGroup):
-    product_id = State()
+# ---------- Məcburi Abunəlik ----------
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
+        return member.status in [ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR]
+    except Exception:
+        return False
 
-class AddProduct(StatesGroup):
-    name = State()
-    price = State()
+def sub_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Kanala Abunə Ol", url=CHANNEL_URL)],
+        [InlineKeyboardButton(text="✅ Abunəliyi yoxla", callback_data="check_sub")]
+    ])
 
 # ---------- Klaviaturalar ----------
 def main_menu(uid):
     kb = [
         [InlineKeyboardButton(text="🛒 Market", callback_data="market")],
+        [InlineKeyboardButton(text="🎮 PUBG UC", callback_data="pubg")],
+        [InlineKeyboardButton(text="🪙 TikTok Jetonları", callback_data="tiktok")],
+        [InlineKeyboardButton(text="📱 SMM Xidmətləri", callback_data="smm")],
         [InlineKeyboardButton(text="💰 Balansım", callback_data="balance")],
-        [InlineKeyboardButton(text="👥 Referal sistemi", callback_data="referal")],
         [InlineKeyboardButton(text="🎁 Gündəlik bonus", callback_data="bonus")],
+        [InlineKeyboardButton(text="👥 Referal sistemi", callback_data="referal")],
+        [InlineKeyboardButton(text="🎧 Dəstək", url="https://t.me/OLDXXsupport")],
+        [InlineKeyboardButton(text="📢 Rəsmi kanal", url=CHANNEL_URL)],
     ]
     if uid == ADMIN_ID:
         kb.append([InlineKeyboardButton(text="👨‍💻 Admin Paneli", callback_data="admin_panel")])
@@ -126,7 +143,7 @@ async def start(message: Message, state: FSMContext):
         conn.close()
         
         if ref_id and ref_id != uid and get_user(ref_id):
-            update_balance(ref_id, 5)
+            update_balance(ref_id, coin=5)
             conn = db()
             c = conn.cursor()
             c.execute("UPDATE users SET referal_count = referal_count + 1 WHERE user_id=%s", (ref_id,))
@@ -136,10 +153,35 @@ async def start(message: Message, state: FSMContext):
             try: await bot.send_message(ref_id, "🎉 Yeni referalınız var! +5 coin qazandınız.")
             except: pass
 
+    if not await is_subscribed(uid):
+        await message.answer(
+            "👑 <b>亗 𝙊𝙇𝘿 𝙓 亗 BOT</b>\n\n"
+            "Botdan istifadə etmək üçün əvvəlcə kanalımıza abunə olmalısınız! 👇",
+            reply_markup=sub_keyboard()
+        )
+        return
+
     await message.answer(
-        f"Salam, {html.bold(message.from_user.full_name)}! 👋\n\nXoş gəldiniz!",
+        f"👑 <b>亗 𝙊𝙇𝘿 𝙓 亗 BOT</b>\n\n"
+        f"Salam, {html.bold(message.from_user.full_name)}! 👋\n\n"
+        f"Rəsmi satış və rəqəmsal xidmət platformamıza xoş gəlmisiniz!\n\n"
+        f"🎮 PUBG UC\n🪙 TikTok Jetonları\n📱 SMM Xidmətləri\n"
+        f"💰 Balans artırma\n🎁 Promo kodlar\n👥 Referal qazancı\n🎉 Gündəlik bonuslar\n\n"
+        f"Bütün xidmətlər bir platformada!",
         reply_markup=main_menu(uid)
     )
+
+@dp.callback_query(F.data == "check_sub")
+async def cb_check_sub(cb: CallbackQuery):
+    if await is_subscribed(cb.from_user.id):
+        await cb.message.edit_text(
+            f"👑 <b>亗 𝙊𝙇𝘿 𝙓 亗 BOT</b>\n\n"
+            f"Salam, {html.bold(cb.from_user.full_name)}! 👋\n\n"
+            f"Rəsmi satış və rəqəmsal xidmət platformamıza xoş gəlmisiniz!",
+            reply_markup=main_menu(cb.from_user.id)
+        )
+    else:
+        await cb.answer("❌ Siz hələ kanala abunə olmamısınız!", show_alert=True)
 
 @dp.callback_query(F.data == "back_main")
 async def cb_back_main(cb: CallbackQuery, state: FSMContext):
@@ -151,7 +193,12 @@ async def cb_back_main(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "balance")
 async def cb_balance(cb: CallbackQuery):
     u = get_user(cb.from_user.id)
-    await cb.message.edit_text(f"💰 <b>Balansınız:</b> {u['balance']} coin", reply_markup=main_menu(cb.from_user.id))
+    await cb.message.edit_text(
+        f"💰 <b>BALANSIM</b>\n\n"
+        f"AZN balansı: <b>{u['azn_balance']} AZN</b>\n"
+        f"Coin balansı: <b>{u['coin_balance']} coin</b>",
+        reply_markup=main_menu(cb.from_user.id)
+    )
     await cb.answer()
 
 # ---------- Referal ----------
@@ -161,7 +208,8 @@ async def cb_referal(cb: CallbackQuery):
     me = await bot.get_me()
     link = f"https://t.me/{me.username}?start=ref_{cb.from_user.id}"
     await cb.message.edit_text(
-        f"👥 <b>Referal sistemi</b>\n\nSizin linkiniz:\n<code>{link}</code>\n\n"
+        f"👥 <b>REFERAL SİSTEMİ</b>\n\n"
+        f"Sizin linkiniz:\n<code>{link}</code>\n\n"
         f"Dəvət etdiyiniz: {u['referal_count']} nəfər\nHər dəvətə: 5 coin",
         reply_markup=main_menu(cb.from_user.id)
     )
@@ -178,33 +226,37 @@ async def cb_bonus(cb: CallbackQuery):
     
     conn = db()
     c = conn.cursor()
-    c.execute("UPDATE users SET balance = balance + 3, last_bonus = %s WHERE user_id=%s", (today, uid))
+    c.execute("UPDATE users SET coin_balance = coin_balance + 3, last_bonus = %s WHERE user_id=%s", (today, uid))
     conn.commit()
     c.close()
     conn.close()
-    await cb.message.edit_text(f"🎁 <b>Gündəlik bonus alındı!</b>\n+3 coin\n\nBalans: {get_user(uid)['balance']} coin", reply_markup=main_menu(uid))
+    await cb.message.edit_text(
+        f"🎁 <b>Gündəlik bonus alındı!</b>\n+3 coin\n\nBalans: {get_user(uid)['coin_balance']} coin",
+        reply_markup=main_menu(uid)
+    )
     await cb.answer("✅ +3 coin")
 
-# ---------- MARKET ----------
-@dp.callback_query(F.data == "market")
-async def cb_market(cb: CallbackQuery):
+# ---------- MARKET (Ümumi) ----------
+@dp.callback_query(F.data.in_({"market", "pubg", "tiktok", "smm"}))
+async def cb_market_category(cb: CallbackQuery):
+    category = cb.data
     conn = db()
     c = conn.cursor(cursor_factory=DictCursor)
-    c.execute("SELECT * FROM products WHERE is_active = TRUE")
+    c.execute("SELECT * FROM products WHERE category=%s AND is_active=TRUE", (category,))
     products = c.fetchall()
     c.close()
     conn.close()
     
     if not products:
-        return await cb.answer("Marketdə hələ məhsul yoxdur.", show_alert=True)
+        return await cb.answer("Bu kateqoriyada hələ məhsul yoxdur.", show_alert=True)
     
-    await cb.message.edit_text("🛒 <b>Market</b>\n\nMəhsul seçin:", reply_markup=main_menu(cb.from_user.id))
+    await cb.message.edit_text(f"📦 <b>{category.upper()}</b> kateqoriyasındakı məhsullar:", reply_markup=main_menu(cb.from_user.id))
     
     for p in products:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"🛍 Al ({p['price']} coin)", callback_data=f"buy_{p['id']}")]
+            [InlineKeyboardButton(text=f"🛍 Al ({p['price']} AZN)", callback_data=f"buy_{p['id']}")]
         ])
-        await cb.message.answer(f"<b>{p['name']}</b>\nQiymət: {p['price']} coin", reply_markup=kb)
+        await cb.message.answer(f"<b>{p['name']}</b>\n{p['description']}\nQiymət: {p['price']} AZN", reply_markup=kb)
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("buy_"))
@@ -222,11 +274,11 @@ async def cb_buy(cb: CallbackQuery):
         c.close(); conn.close()
         return await cb.answer("Məhsul tapılmadı.", show_alert=True)
     
-    if u["balance"] < p["price"]:
+    if u["azn_balance"] < p["price"]:
         c.close(); conn.close()
-        return await cb.answer("❌ Balansınız kifayət etmir!", show_alert=True)
+        return await cb.answer("❌ Balansınız kifayət etmir! Zəhmət olmasa balans artırın.", show_alert=True)
     
-    update_balance(uid, -p["price"])
+    update_balance(uid, azn=-p["price"])
     
     c.execute("INSERT INTO orders (user_id, product_id, product_name, price) VALUES (%s, %s, %s, %s) RETURNING id", 
               (uid, product_id, p["name"], p["price"]))
@@ -235,7 +287,16 @@ async def cb_buy(cb: CallbackQuery):
     c.close()
     conn.close()
     
-    await cb.message.edit_text(f"✅ <b>Sifariş qeydə alındı!</b>\n\nMəhsul: {p['name']}\nÖdənildi: {p['price']} coin\nSifariş ID: #{order_id}\n\nAdmin tezliklə sizinlə əlaqə saxlayacaq.", reply_markup=main_menu(uid))
+    await cb.message.edit_text(
+        f"✅ <b>SİFARİŞİNİZ QEYDƏ ALINDI!</b>\n\n"
+        f"📦 Məhsul: {p['name']}\n"
+        f"🆔 Sifariş nömrəsi: #OLDX-{order_id}\n"
+        f"💰 Ödənilən məbləğ: {p['price']} AZN\n"
+        f"📅 Tarix: {date.today().isoformat()}\n"
+        f"📌 Status: Gözləmədə\n\n"
+        f"Sifarişiniz admin tərəfindən yoxlanılacaq.",
+        reply_markup=main_menu(uid)
+    )
     await cb.answer("✅ Sifariş qəbul edildi!")
     
     try:
@@ -244,8 +305,8 @@ async def cb_buy(cb: CallbackQuery):
             f"👤 İstifadəçi: {cb.from_user.full_name}\n"
             f"🆔 ID: <code>{uid}</code>\n"
             f"📦 Məhsul: {p['name']}\n"
-            f"💰 Qiymət: {p['price']} coin\n"
-            f"📋 Sifariş ID: #{order_id}"
+            f"💰 Qiymət: {p['price']} AZN\n"
+            f"📋 Sifariş ID: #OLDX-{order_id}"
         )
     except: pass
 
@@ -259,51 +320,45 @@ async def cb_admin_panel(cb: CallbackQuery):
 @dp.callback_query(F.data == "add_product")
 async def cb_add_product(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID: return
+    await cb.message.edit_text("📝 Məhsulun adını yazın:\n(Kateqoriya əlavə etmək üçün: market/pubg/tiktok/smm)")
     await state.set_state(AddProduct.name)
-    await cb.message.edit_text("📝 Məhsulun adını yazın:")
     await cb.answer()
+
+class AddProduct(StatesGroup):
+    name = State()
+    price = State()
+    category = State()
 
 @dp.message(AddProduct.name)
 async def process_add_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(AddProduct.price)
-    await message.answer("💰 Məhsulun qiymətini (coin) yazın:")
+    await message.answer("💰 Məhsulun qiymətini (AZN) yazın:")
 
 @dp.message(AddProduct.price)
 async def process_add_price(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        return await message.answer("Yalnız rəqəm yazın.")
-    data = await state.get_data()
+    try: price = float(message.text)
+    except: return await message.answer("Yalnız rəqəm yazın.")
+    await state.update_data(price=price)
+    await state.set_state(AddProduct.category)
+    await message.answer("📂 Kateqoriyanı seçin:\nmarket / pubg / tiktok / smm")
+
+@dp.message(AddProduct.category)
+async def process_add_category(message: Message, state: FSMContext):
+    category = message.text.lower()
+    if category not in ["market", "pubg", "tiktok", "smm"]:
+        return await message.answer("Yalnız market, pubg, tiktok, smm yazın.")
     
+    data = await state.get_data()
     conn = db()
     c = conn.cursor()
-    c.execute("INSERT INTO products (name, price) VALUES (%s, %s)", (data['name'], int(message.text)))
+    c.execute("INSERT INTO products (name, price, category) VALUES (%s, %s, %s)", (data['name'], data['price'], category))
     conn.commit()
     c.close()
     conn.close()
     
     await state.clear()
-    await message.answer(f"✅ Məhsul əlavə edildi: <b>{data['name']}</b> - {message.text} coin", reply_markup=main_menu(message.from_user.id))
-
-@dp.callback_query(F.data == "view_orders")
-async def cb_view_orders(cb: CallbackQuery):
-    if cb.from_user.id != ADMIN_ID: return
-    conn = db()
-    c = conn.cursor(cursor_factory=DictCursor)
-    c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 10")
-    orders = c.fetchall()
-    c.close()
-    conn.close()
-    
-    if not orders:
-        return await cb.answer("Sifariş yoxdur.", show_alert=True)
-    
-    text = "📋 <b>Son 10 sifariş:</b>\n\n"
-    for o in orders:
-        text += f"#{o['id']} - {o['product_name']} - {o['price']} coin - <code>{o['user_id']}</code>\n"
-    
-    await cb.message.edit_text(text, reply_markup=admin_menu())
-    await cb.answer()
+    await message.answer(f"✅ Məhsul əlavə edildi: <b>{data['name']}</b> - {data['price']} AZN ({category})", reply_markup=main_menu(message.from_user.id))
 
 # ---------- START ----------
 async def start_polling():
