@@ -1,4 +1,0 @@
-aiogram
-flask
-python-dotenv
-psycopg2-binary
