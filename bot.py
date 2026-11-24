@@ -39,26 +39,55 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
+    # İstifadəçilər
     c.execute("""CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY, full_name TEXT, 
         azn_balance NUMERIC(10,2) DEFAULT 0, 
         coin_balance INTEGER DEFAULT 0,
         referal_id BIGINT, referal_count INTEGER DEFAULT 0, 
-        last_bonus TEXT
+        last_bonus TEXT, is_banned BOOLEAN DEFAULT FALSE
     )""")
+    # Məhsullar
     c.execute("""CREATE TABLE IF NOT EXISTS products (
         id SERIAL PRIMARY KEY, category TEXT, name TEXT, 
         description TEXT, price NUMERIC(10,2), is_active BOOLEAN DEFAULT TRUE
     )""")
+    # Sifarişlər
     c.execute("""CREATE TABLE IF NOT EXISTS orders (
         id SERIAL PRIMARY KEY, user_id BIGINT, product_id INTEGER, product_name TEXT, 
         price NUMERIC(10,2), status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
+    # Depozitlər
+    c.execute("""CREATE TABLE IF NOT EXISTS deposits (
+        id SERIAL PRIMARY KEY, user_id BIGINT, amount NUMERIC(10,2), 
+        method TEXT, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    # Çıxarışlar
+    c.execute("""CREATE TABLE IF NOT EXISTS withdrawals (
+        id SERIAL PRIMARY KEY, user_id BIGINT, amount NUMERIC(10,2), 
+        method TEXT, destination TEXT, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    # Promo Kodlar
+    c.execute("""CREATE TABLE IF NOT EXISTS promo_codes (
+        id SERIAL PRIMARY KEY, code TEXT UNIQUE, reward_type TEXT, 
+        reward_amount NUMERIC(10,2), max_uses INTEGER DEFAULT 1, 
+        current_uses INTEGER DEFAULT 0, is_active BOOLEAN DEFAULT TRUE
+    )""")
+    # Promo İstifadə
+    c.execute("""CREATE TABLE IF NOT EXISTS promo_used (
+        user_id BIGINT, code TEXT, PRIMARY KEY (user_id, code)
+    )""")
+    # Dəstək
+    c.execute("""CREATE TABLE IF NOT EXISTS support_tickets (
+        id SERIAL PRIMARY KEY, user_id BIGINT, message TEXT, 
+        status TEXT DEFAULT 'open', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
     conn.commit()
     
+    # Admini yoxla və yarat
     c.execute("SELECT 1 FROM users WHERE user_id=%s", (ADMIN_ID,))
     if not c.fetchone():
-        c.execute("INSERT INTO users (user_id, full_name, azn_balance, coin_balance) VALUES (%s, %s, 100, 1000)", (ADMIN_ID, "Admin"))
+        c.execute("INSERT INTO users (user_id, full_name, azn_balance, coin_balance) VALUES (%s, %s, 1000, 5000)", (ADMIN_ID, "Admin"))
         conn.commit()
     c.close()
     conn.close()
@@ -101,6 +130,8 @@ def main_menu(uid):
         [InlineKeyboardButton(text="💰 Balansım", callback_data="balance")],
         [InlineKeyboardButton(text="🎁 Gündəlik bonus", callback_data="bonus")],
         [InlineKeyboardButton(text="👥 Referal sistemi", callback_data="referal")],
+        [InlineKeyboardButton(text="🎟 Promo kod", callback_data="promo")],
+        [InlineKeyboardButton(text="🎧 Dəstək", callback_data="support")],
         [InlineKeyboardButton(text="📢 Rəsmi kanal", url=CHANNEL_URL)],
     ]
     if uid == ADMIN_ID:
@@ -111,8 +142,27 @@ def admin_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Məhsul əlavə et", callback_data="add_product")],
         [InlineKeyboardButton(text="📋 Sifarişlərə bax", callback_data="view_orders")],
+        [InlineKeyboardButton(text="🎟 Promo kod yarat", callback_data="create_promo")],
+        [InlineKeyboardButton(text="💸 Çıxarış tələbləri", callback_data="view_withdrawals")],
         [InlineKeyboardButton(text="🔙 Geri", callback_data="back_main")]
     ])
+
+# ---------- FSM States ----------
+class AddProduct(StatesGroup):
+    name = State()
+    price = State()
+    category = State()
+
+class AddPromo(StatesGroup):
+    code = State()
+    reward_type = State()
+    reward_amount = State()
+
+class SupportMsg(StatesGroup):
+    message = State()
+
+class PromoState(StatesGroup):
+    code = State()
 
 # ---------- /start ----------
 @dp.message(CommandStart())
@@ -229,17 +279,98 @@ async def cb_bonus(cb: CallbackQuery):
     )
     await cb.answer("✅ +3 coin")
 
+# ---------- PROMO KOD ----------
+@dp.callback_query(F.data == "promo")
+async def cb_promo(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text(
+        "🎟 <b>PROMO KOD</b>\n\nZəhmət olmasa promo kodunuzu yazın:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Geri", callback_data="back_main")]])
+    )
+    await state.set_state(PromoState.code)
+    await cb.answer()
+
+@dp.message(PromoState.code)
+async def process_promo(message: Message, state: FSMContext):
+    code = message.text.strip().upper()
+    uid = message.from_user.id
+    await state.clear()
+    
+    conn = db()
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute("SELECT * FROM promo_codes WHERE code=%s AND is_active=TRUE", (code,))
+    promo = c.fetchone()
+    
+    if not promo:
+        c.close(); conn.close()
+        return await message.answer("❌ Belə bir promo kod yoxdur.", reply_markup=main_menu(uid))
+    
+    if promo['current_uses'] >= promo['max_uses']:
+        c.close(); conn.close()
+        return await message.answer("❌ Bu promo kodun istifadə limiti bitib.", reply_markup=main_menu(uid))
+    
+    c.execute("SELECT 1 FROM promo_used WHERE user_id=%s AND code=%s", (uid, code))
+    if c.fetchone():
+        c.close(); conn.close()
+        return await message.answer("❌ Siz bu promo kodu artıq istifadə etmisiniz.", reply_markup=main_menu(uid))
+    
+    c.execute("INSERT INTO promo_used (user_id, code) VALUES (%s, %s)", (uid, code))
+    c.execute("UPDATE promo_codes SET current_uses = current_uses + 1 WHERE code=%s", (code,))
+    
+    if promo['reward_type'] == 'coin':
+        c.execute("UPDATE users SET coin_balance = coin_balance + %s WHERE user_id=%s", (promo['reward_amount'], uid))
+        reward_text = f"+{promo['reward_amount']} coin"
+    elif promo['reward_type'] == 'azn':
+        c.execute("UPDATE users SET azn_balance = azn_balance + %s WHERE user_id=%s", (promo['reward_amount'], uid))
+        reward_text = f"+{promo['reward_amount']} AZN"
+    
+    conn.commit()
+    c.close()
+    conn.close()
+    
+    await message.answer(f"✅ Promo kod aktivləşdirildi! {reward_text}", reply_markup=main_menu(uid))
+
+# ---------- DƏSTƏK ----------
+@dp.callback_query(F.data == "support")
+async def cb_support(cb: CallbackQuery, state: FSMContext):
+    await cb.message.edit_text(
+        "🎧 <b>DƏSTƏK</b>\n\nZəhmət olmasa sualınızı və ya probleminizi yazın. Admin tezliklə cavab verəcək.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Geri", callback_data="back_main")]])
+    )
+    await state.set_state(SupportMsg.message)
+    await cb.answer()
+
+@dp.message(SupportMsg.message)
+async def process_support(message: Message, state: FSMContext):
+    uid = message.from_user.id
+    text = message.text
+    await state.clear()
+    
+    conn = db()
+    c = conn.cursor()
+    c.execute("INSERT INTO support_tickets (user_id, message) VALUES (%s, %s) RETURNING id", (uid, text))
+    ticket_id = c.fetchone()[0]
+    conn.commit()
+    c.close()
+    conn.close()
+    
+    await message.answer(f"✅ Mesajınız qəbul edildi (Ticket #{ticket_id}). Admin tezliklə cavab verəcək.", reply_markup=main_menu(uid))
+    
+    try:
+        await bot.send_message(ADMIN_ID, 
+            f"🔔 <b>YENİ DƏSTƏK MÜRACİƏTİ</b>\n\n"
+            f"👤 İstifadəçi: {message.from_user.full_name}\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"📝 Mesaj: {text}\n"
+            f"🎫 Ticket: #{ticket_id}"
+        )
+    except: pass
+
 # ---------- ADMIN PANEL ----------
 @dp.callback_query(F.data == "admin_panel")
 async def cb_admin_panel(cb: CallbackQuery):
     if cb.from_user.id != ADMIN_ID: return
     await cb.message.edit_text("👨‍💻 <b>Admin Paneli</b>", reply_markup=admin_menu())
     await cb.answer()
-
-class AddProduct(StatesGroup):
-    name = State()
-    price = State()
-    category = State()
 
 @dp.callback_query(F.data == "add_product")
 async def cb_add_product(cb: CallbackQuery, state: FSMContext):
@@ -278,6 +409,125 @@ async def process_add_category(message: Message, state: FSMContext):
     
     await state.clear()
     await message.answer(f"✅ Məhsul əlavə edildi: <b>{data['name']}</b> - {data['price']} AZN ({category})", reply_markup=main_menu(message.from_user.id))
+
+@dp.callback_query(F.data == "create_promo")
+async def cb_create_promo(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID: return
+    await cb.message.edit_text("🎟 Promo kodun adını yazın (məsələn: OLDX10):")
+    await state.set_state(AddPromo.code)
+    await cb.answer()
+
+@dp.message(AddPromo.code)
+async def process_promo_code(message: Message, state: FSMContext):
+    await state.update_data(code=message.text.upper())
+    await state.set_state(AddPromo.reward_type)
+    await message.answer("🎁 Mükafat növünü seçin:\ncoin / azn")
+
+@dp.message(AddPromo.reward_type)
+async def process_promo_type(message: Message, state: FSMContext):
+    rtype = message.text.lower()
+    if rtype not in ["coin", "azn"]:
+        return await message.answer("Yalnız coin və ya azn yazın.")
+    await state.update_data(reward_type=rtype)
+    await state.set_state(AddPromo.reward_amount)
+    await message.answer("💰 Mükafat miqdarını yazın:")
+
+@dp.message(AddPromo.reward_amount)
+async def process_promo_amount(message: Message, state: FSMContext):
+    try: amount = float(message.text)
+    except: return await message.answer("Yalnız rəqəm yazın.")
+    
+    data = await state.get_data()
+    conn = db()
+    c = conn.cursor()
+    c.execute("INSERT INTO promo_codes (code, reward_type, reward_amount) VALUES (%s, %s, %s)", 
+              (data['code'], data['reward_type'], amount))
+    conn.commit()
+    c.close()
+    conn.close()
+    
+    await state.clear()
+    await message.answer(f"✅ Promo kod yaradıldı: <b>{data['code']}</b> - {amount} {data['reward_type']}", reply_markup=main_menu(message.from_user.id))
+
+@dp.callback_query(F.data == "view_orders")
+async def cb_view_orders(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    conn = db()
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute("SELECT * FROM orders ORDER BY id DESC LIMIT 10")
+    orders = c.fetchall()
+    c.close()
+    conn.close()
+    
+    if not orders:
+        return await cb.answer("Sifariş yoxdur.", show_alert=True)
+    
+    text = "📋 <b>Son 10 sifariş:</b>\n\n"
+    for o in orders:
+        text += f"#{o['id']} - {o['product_name']} - {o['price']} AZN - <code>{o['user_id']}</code>\n"
+    
+    await cb.message.edit_text(text, reply_markup=admin_menu())
+    await cb.answer()
+
+@dp.callback_query(F.data == "view_withdrawals")
+async def cb_view_withdrawals(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    conn = db()
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute("SELECT * FROM withdrawals WHERE status='pending'")
+    reqs = c.fetchall()
+    c.close()
+    conn.close()
+    
+    if not reqs:
+        return await cb.answer("Gözləyən çıxarış yoxdur.", show_alert=True)
+    
+    await cb.message.edit_text("💸 <b>Çıxarış Tələbləri</b>", reply_markup=admin_menu())
+    for r in reqs:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Təsdiqlə", callback_data=f"approve_wd_{r['id']}")],
+            [InlineKeyboardButton(text="❌ Rədd et", callback_data=f"reject_wd_{r['id']}")]
+        ])
+        await cb.message.answer(f"İstifadəçi: <code>{r['user_id']}</code>\nMəbləğ: {r['amount']} AZN\nÜsul: {r['method']}\nÜnvan: {r['destination']}", reply_markup=kb)
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("approve_wd_"))
+async def cb_approve_wd(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    wd_id = int(cb.data.replace("approve_wd_", ""))
+    conn = db()
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute("UPDATE withdrawals SET status='approved' WHERE id=%s RETURNING user_id, amount", (wd_id,))
+    row = c.fetchone()
+    conn.commit()
+    c.close()
+    conn.close()
+    
+    if row:
+        await cb.message.edit_text(f"✅ Çıxarış (ID: {wd_id}) təsdiqləndi.")
+        try: await bot.send_message(row['user_id'], f"✅ Çıxarış tələbiniz ({row['amount']} AZN) təsdiqləndi!")
+        except: pass
+    await cb.answer()
+
+@dp.callback_query(F.data.startswith("reject_wd_"))
+async def cb_reject_wd(cb: CallbackQuery):
+    if cb.from_user.id != ADMIN_ID: return
+    wd_id = int(cb.data.replace("reject_wd_", ""))
+    conn = db()
+    c = conn.cursor(cursor_factory=DictCursor)
+    c.execute("UPDATE withdrawals SET status='rejected' WHERE id=%s RETURNING user_id, amount", (wd_id,))
+    row = c.fetchone()
+    if row:
+        c.execute("UPDATE users SET azn_balance = azn_balance + %s WHERE user_id=%s", (row['amount'], row['user_id']))
+    conn.commit()
+    c.close()
+    conn.close()
+    
+    if row:
+        await cb.message.edit_text(f"❌ Çıxarış (ID: {wd_id}) rədd edildi, balans qaytarıldı.")
+        try: await bot.send_message(row['user_id'], f"❌ Çıxarış tələbiniz rədd edildi, {row['amount']} AZN balansınıza qaytarıldı.")
+        except: pass
+    await cb.answer()
 
 # ---------- START ----------
 async def start_polling():
